@@ -74,14 +74,66 @@ def dmx_to_float(dmx_val):
 def valid_dmx_addr(addr):
     return addr >= 1 and addr <= 512
 
+class RFUBackend(object):
+    """The common backend for all RFU instances."""
+    def __init__(self, enttec, osc_handler, debug):
+        self.enttec = enttec
+        self.rfus = {}
+        self.osc_handler = osc_handler
+        self.debug = debug
+
+    def add_rfu(self, ipaddr):
+        rfu = RFU(self.osc_handler, ipaddr, self)
+        self.rfus[ipaddr] = rfu
+        self.osc_handler.add_sender(ipaddr)
+        rfu.select_channel(1)
+
+    def remove_rfu(self, ipaddr):
+        try:
+            del self.rfus[ipaddr]
+            self.osc_handler.remove_sender(ipaddr)
+        except KeyError:
+            pass
+
+    def list_rfus(self):
+        return self.rfus.keys()
+
+    def numpad_action(self, ipaddr, x, y):
+        try:
+            self.rfus[ipaddr].numpad_action(x, y)
+        except KeyError:
+            print("Numpad action from unknown RFU: {}".format(ipaddr))
+
+    def set_level_action(self, ipaddr, level):
+        try:
+            self.rfus[ipaddr].set_level(level)
+        except KeyError:
+            print("Set level action from unknown RFU: {}".format(ipaddr))
+
+    def get_level(self, chan):
+        return self.enttec.dmx_frame[chan-1]
+
+    def set_level(self, chan, val):
+        self.enttec.dmx_frame[chan-1] = val
+        self.enttec.render()
+        self.update_level(chan)
+
+    def update_level(self, chan):
+        level = self.get_level(chan)
+        for rfu in self.rfus.itervalues():
+            if rfu.current_chan == chan:
+                rfu.level = level
+
 class RFU(object):
     """Remote focus unit model."""
 
-    def __init__(self, enttec, osc_handler):
+    def __init__(self, osc_handler, ipaddr, backend):
+        self.ipaddr = ipaddr
         self.current_chan = 0
-        self.enttec = enttec
         self.osc_handler = osc_handler
         self.numpad = NumberPad(3)
+        self.backend = backend
+        self.debug = backend.debug
 
     def numpad_action(self, x, y):
         key = self.numpad.parse_command(x, y)
@@ -93,30 +145,29 @@ class RFU(object):
             
             self.numpad.clear()
 
-        self.osc_handler.set_readout(self.numpad.parse(str))
+        self.osc_handler.set_readout(self.ipaddr, self.numpad.parse(str))
 
 
     def select_channel(self, chan):
         print('selecting channel {}'.format(chan))
-        self.current_chan = chan-1
-        self.osc_handler.set_current_channel(chan)
-        self.osc_handler.set_level(dmx_to_float(self.level))
-        self.osc_handler.set_level_indicator(dmx_to_float(self.level))
+        self.current_chan = chan
+
+        self.osc_handler.set_current_channel(self.ipaddr, chan)
+        self.osc_handler.set_level(self.ipaddr, dmx_to_float(self.level))
+        self.osc_handler.set_level_indicator(self.ipaddr, dmx_to_float(self.level))
 
     @property
     def level(self):
-        return self.enttec.dmx_frame[self.current_chan]
+        return self.backend.get_level(self.current_chan)
 
     @level.setter
     def level(self, val):
-        self.osc_handler.set_level_indicator(dmx_to_float(self.level))
-        self.enttec.dmx_frame[self.current_chan] = val
-        self.enttec.render()
+        self.osc_handler.set_level_indicator(self.ipaddr, dmx_to_float(self.level))
         if self.debug:
-            print('Setting channel {} to {}'.format(self.current_chan+1, self.level))
+            print('Setting channel {} to {}'.format(self.current_chan, self.level))
 
     def set_level(self, val):
-        self.level = val
+        self.backend.set_level(self.current_chan, val)
 
 
 
@@ -127,9 +178,20 @@ class OSCController(object):
         self.receiver = OSC.OSCServer( (config['receive_host'], config['receive_port']) )
         self.receiver.addMsgHandler('default', self.handle_osc_message)
 
-        self.sender = OSC.OSCClient()
-        self.sender.connect( (config['send_host'], config['send_port']) )
+        self.senders = {}
+
         self.control_groups = {}
+
+    def add_sender(self, ipaddr, port=9000):
+        sender = OSC.OSCClient()
+        sender.connect( (ipaddr, port) )
+        self.senders[ipaddr] = sender
+
+    def remove_sender(self, ipaddr):
+        try:
+            del self.senders[ipaddr]
+        except KeyError:
+            pass
 
     def create_control_group(self, name):
         if name not in self.control_groups:
@@ -138,19 +200,19 @@ class OSCController(object):
     def create_simple_control(self, group, name, action, preprocessor=None):
         """Create a pure osc listener, with no talkback."""
         if preprocessor is None:
-            def callback(_, payload):
-                action(payload[0])
+            def callback(ipaddr, _, payload):
+                action(ipaddr, payload[0])
         else:
-            def callback(_, payload):
+            def callback(ipaddr, _, payload):
                 processed = preprocessor(payload[0])
                 if processed is not None:
-                    action(processed)
+                    action(ipaddr, processed)
 
         self.control_groups[group][name] = callback
 
     def create_dmx_entry_pad(self, group, name, number_pad_parser):
         """Number pad control."""
-        def callback(addr, payload):
+        def callback(ipaddr, addr, payload):
             print("running numpad callback {}".format(addr))
             if ignore_all_but_1(payload[0]) is None:
                 return
@@ -161,7 +223,7 @@ class OSCController(object):
             x = int(elements[3])-1
             y = int(elements[4])-1
 
-            number_pad_parser(x, y)
+            number_pad_parser(ipaddr, x, y)
 
         self.control_groups[group][name] = callback
 
@@ -175,44 +237,44 @@ class OSCController(object):
         try:
             group = self.control_groups[group_name]
         except KeyError:
-            logging.log("Unknown control group: {}".format(group_name))
+            print("Unknown control group: {}".format(group_name))
             return
         try:
             control = group[control_name]
         except KeyError:
-            logging.log("Unknown control {} in group {}"
-                        .format(control_name, group_name))
-        control(addr, payload)
+            print("Unknown control {} in group {}"
+                  .format(control_name, group_name))
+        control(source_addr[0], addr, payload)
 
-    def send_button_on(self, addr):
+    def send_button_on(self, ipaddr, addr):
         msg = OSC.OSCMessage()
         msg.setAddress(addr)
         msg.append(1.0)
-        self.sender.send(msg)
+        self.senders[ipaddr].send(msg)
 
-    def send_button_off(self, addr):
+    def send_button_off(self, ipaddr, addr):
         msg = OSC.OSCMessage()
         msg.setAddress(addr)
         msg.append(0.0)
-        self.sender.send(msg)
+        self.senders[ipaddr].send(msg)
 
-    def send_value(self, addr, val):
+    def send_value(self, ipaddr, addr, val):
         msg = OSC.OSCMessage()
         msg.setAddress(addr)
         msg.append(val)
-        self.sender.send(msg)
+        self.senders[ipaddr].send(msg)
 
-    def set_readout(self, val):
-        self.send_value('/RFU/Readout', val)
+    def set_readout(self, ipaddr, val):
+        self.send_value(ipaddr, '/RFU/Readout', val)
 
-    def set_current_channel(self, val):
-        self.send_value('/RFU/CurrentChannel', str(val))
+    def set_current_channel(self, ipaddr, val):
+        self.send_value(ipaddr, '/RFU/CurrentChannel', str(val))
 
-    def set_level(self, val):
-        self.send_value('/RFU/Level', val)
+    def set_level(self, ipaddr, val):
+        self.send_value(ipaddr, '/RFU/Level', val)
 
-    def set_level_indicator(self, val):
-        self.send_value('/RFU/LevelIndicator', str(float_to_dmx_val(val)))
+    def set_level_indicator(self, ipaddr, val):
+        self.send_value(ipaddr, '/RFU/LevelIndicator', str(float_to_dmx_val(val)))
 
 def ignore_all_but_1(value):
     return value if value == 1.0 else None
@@ -243,22 +305,23 @@ if __name__ == '__main__':
 
     cont = OSCController(config)
 
-    rfu = RFU(enttec, cont)
+    rfus = RFUBackend(enttec, cont, config["debug"])
 
     cont.create_control_group('RFU')
 
-    cont.create_dmx_entry_pad('RFU', 'DMXEntry', rfu.numpad_action)
-    cont.create_simple_control('RFU', 'Level', rfu.set_level, float_to_dmx_val)
+    cont.create_dmx_entry_pad('RFU', 'DMXEntry', rfus.numpad_action)
+    cont.create_simple_control('RFU', 'Level', rfus.set_level_action, float_to_dmx_val)
     
-
-    rfu.debug = config["debug"]
-    rfu.select_channel(1)
 
     # start the osc server
     # Start OSCServer
     print("\nStarting OSCServer.")
     st = threading.Thread( target = cont.receiver.serve_forever )
     st.start()
+
+    for ipaddr in config["send_hosts"]:
+        print(ipaddr)
+        rfus.add_rfu(ipaddr)
 
     try:
         while True:
@@ -268,9 +331,26 @@ if __name__ == '__main__':
                 #except Empty:
                 #    time.sleep(0.1)
             #else:
-            user_input = raw_input('Enter q to quit.')
+            print("Commands:\n"
+                  "add:12.34.56.78 to add a new RFU.\n"
+                  "del:12.34.56.78 to remove an RFU.\n"
+                  "list to list connected RFUs\n"
+                  "help to diplay this message\n"
+                  "q to quit")
+            user_input = raw_input('Enter command:')
             if user_input == 'q':
                 break
+            elif user_input == 'help':
+                continue
+            elif user_input == 'list':
+                print(rfus.list_rfus())
+            elif user_input.startswith('add:'):
+                ipaddr = user_input.split(':')[1]
+                rfus.add_rfu(ipaddr)
+
+            elif user_input.startswith('del:'):
+                ipaddr = user_input.split(':')[1]
+                rfus.remove_rfu(ipaddr)
 
 
     finally:
